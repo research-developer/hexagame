@@ -32,6 +32,17 @@ const COLORS = {
 };
 const COLOR_KEYS = Object.keys(COLORS);
 
+// Each direction has a fixed rainbow color, walking clockwise around the wheel
+// starting from N. Color = direction signal; the arrow glyph is redundant info.
+const DIR_COLOR = {
+  N:  "coral",  // red
+  NE: "amber",  // orange
+  SE: "sun",    // yellow
+  S:  "mint",   // green
+  SW: "azure",  // blue
+  NW: "violet", // violet
+};
+
 // per-player palette (clearly distinct from any tile palette accent)
 const PLAYERS = [
   { name: "P1", glow: "#3fc7ff", base: "#1aa7e6", deep: "#0a3a55", soft: "rgba(63,199,255,.18)" },
@@ -122,7 +133,7 @@ function packBoard(board, R) {
     if (bestList.length === 0) return; // unpackable cell remains
     const pick = bestList[rnd(bestList.length)];
     const dName = pick.v[rnd(pick.v.length)];
-    board.set(key(pick.q, pick.r), { color: COLOR_KEYS[rnd(6)], dir: dName });
+    board.set(key(pick.q, pick.r), { color: DIR_COLOR[dName], dir: dName });
   }
 }
 
@@ -407,19 +418,18 @@ export default function HexBlast() {
     // chain disabled in two-player mode
     const mult = modeRef.current === "2p" ? 1 : (now < prev.expire ? prev.mult + 1 : 1);
     const n = group.length;
-    const sameColor = group.every((g) => g.color === group[0].color);
     const diag = isDiagonal(tile.dir);
 
+    // color is fixed by direction, so any sweep is inherently same-color;
+    // the old colorBonus is folded into sweepBonus
     const base = n * 12;
-    const sweepBonus = n > 1 ? n * n * 6 : 0;
-    const colorBonus = sameColor && n > 1 ? n * n * 10 : 0;
-    const diagBonus = sameColor && diag && n >= 2 ? n * n * 16 : 0;
-    const gained = (base + sweepBonus + colorBonus + diagBonus) * mult;
+    const sweepBonus = n > 1 ? n * n * 16 : 0;
+    const diagBonus = diag && n >= 2 ? n * n * 16 : 0;
+    const gained = (base + sweepBonus + diagBonus) * mult;
 
     const tags: string[] = [];
     if (n > 1) tags.push(`${n}× SWEEP`);
     if (diagBonus) tags.push("◆ DIAGONAL");
-    else if (colorBonus) tags.push("PURE COLOR");
 
     histRef.current.push({ board: new Map(b), score, moves, pScores: [...pScores] as [number, number], turn });
     if (histRef.current.length > 40) histRef.current.shift();
@@ -777,10 +787,11 @@ export default function HexBlast() {
             <h2 style={styles.cardTitle}>HOW TO PLAY</h2>
             <ul style={styles.rules}>
               <li><b>Tap a tile</b> — it folds cell-by-cell off the board in the direction its arrow points.</li>
-              <li><b>Sweep combo:</b> any tile in its path pointing the <i>same</i> direction tumbles off <i>with</i> it. Empty gaps are passed over freely.</li>
-              <li><b>Blocked:</b> a tile pointing a <i>different</i> direction stops the shot. The tapped tile leans forward, plays a soft error tone, and reflects back to its origin.</li>
+              <li><b>Color = direction:</b> each rainbow color points its own way — red ↑, orange ↗, yellow ↘, green ↓, blue ↙, violet ↖. Same color in a row = sweepable lane.</li>
+              <li><b>Sweep combo:</b> any tile in its path pointing the <i>same</i> direction (same color) tumbles off <i>with</i> it. Empty gaps are passed over freely.</li>
+              <li><b>Blocked:</b> a tile of a <i>different</i> color stops the shot. The tapped tile leans forward, plays a soft error tone, and reflects back to its origin.</li>
               <li><b>Score:</b> big sweeps pay off fast — a 5-tile sweep is worth far more than five singles.</li>
-              <li><b>◆ Diagonal bonus:</b> sweep a run that's all <i>one color</i> along a <i>diagonal</i> for a big extra payout.</li>
+              <li><b>◆ Diagonal bonus:</b> sweep along a <i>diagonal</i> (orange, yellow, blue, violet) for an extra payout.</li>
               <li><b>Chains (solo only):</b> fire again before the chain meter empties to stack ×2, ×3… on every point you earn.</li>
               <li><b>2 Player:</b> players alternate turns — even on a blocked tap, your turn ends. No chain multiplier. Highest score when the grid clears wins.</li>
               <li><b>Goal:</b> clear every tile. Each board is always solvable.</li>
