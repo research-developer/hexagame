@@ -1,13 +1,15 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { RotateCcw, Undo2, Volume2, VolumeX, HelpCircle, Zap, ChevronRight, X } from "lucide-react";
+import { RotateCcw, Undo2, Volume2, VolumeX, HelpCircle, Zap, ChevronRight, X, User, Users } from "lucide-react";
 
 /*  HEX BLAST  — an original sweep-combo hex puzzle.
-    Tap a tile: it flies off the board in its arrow direction, sweeping any
-    SAME-direction tile in its path along with it. A DIFFERENT-direction tile
-    blocks the shot. Big sweeps + fast chains = huge scores.            */
+    Tap a tile: it folds cell-by-cell off the board in its arrow direction,
+    sweeping any SAME-direction tile in its path along with it. A DIFFERENT-
+    direction tile blocks the shot — the tile leans forward and reflects
+    back to its origin.                                                  */
 
 const SIZE = 30;                       // hex radius (user units)
-const CHAIN_WINDOW = 2600;             // ms to keep a chain alive
+const CHAIN_WINDOW = 2600;             // ms to keep a chain alive (solo only)
+const FOLD_MS = 130;                   // ms per cell when folding
 
 // flat-top hex, axial (q,r). Six directions w/ draw angle (0 = up, clockwise).
 const DIRS = {
@@ -30,10 +32,17 @@ const COLORS = {
 };
 const COLOR_KEYS = Object.keys(COLORS);
 
+// per-player palette (clearly distinct from any tile palette accent)
+const PLAYERS = [
+  { name: "P1", glow: "#3fc7ff", base: "#1aa7e6", deep: "#0a3a55", soft: "rgba(63,199,255,.18)" },
+  { name: "P2", glow: "#ff6bd4", base: "#e63ab0", deep: "#5a0a48", soft: "rgba(255,107,212,.18)" },
+];
+
 // ---------- hex geometry ----------
 const px = (q, r) => ({ x: SIZE * 1.5 * q, y: SIZE * Math.sqrt(3) * (r + q / 2) });
 const cubeMax = (q, r) => { const x = q, z = r, y = -x - z; return Math.max(Math.abs(x), Math.abs(y), Math.abs(z)); };
 const key = (q, r) => q + "," + r;
+const STEP_PX = SIZE * Math.sqrt(3); // distance between adjacent flat-top hex centers
 
 function allCells(R) {
   const out = [];
@@ -197,12 +206,20 @@ function genBoardDiff(R, lvl, band) {
   return band.expert ? bestForExpert : (inBand || closest);
 }
 
+// number of cells from (q,r) traveling in dir until fully off the board
+function stepsToEdge(q, r, dir, R) {
+  const d = DIRS[dir];
+  let cq = q, cr = r, steps = 0;
+  while (cubeMax(cq, cr) <= R) { cq += d.dq; cr += d.dr; steps++; }
+  return steps + 1; // one extra so the tile leaves the visible frame
+}
+
 // ---------- tiny web-audio juice ----------
 function useBlips(enabledRef) {
   const ctxRef = useRef(null);
   const ensure = () => {
     if (!ctxRef.current) {
-      try { ctxRef.current = new (window.AudioContext || window.webkitAudioContext)(); }
+      try { ctxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)(); }
       catch { ctxRef.current = null; }
     }
     return ctxRef.current;
@@ -220,25 +237,45 @@ function useBlips(enabledRef) {
     o.connect(g); g.connect(ctx.destination);
     o.start(t); o.stop(t + dur);
   };
+  // subtle two-step descending blip — soft, never harsh
+  const errSoft = () => {
+    if (!enabledRef.current) return;
+    const ctx = ensure(); if (!ctx) return;
+    if (ctx.state === "suspended") ctx.resume();
+    const t = ctx.currentTime;
+    const mk = (f, t0, dur) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f, t0);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.07, t0 + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0008, t0 + dur);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t0); o.stop(t0 + dur);
+    };
+    mk(440, t, 0.09);
+    mk(330, t + 0.07, 0.13);
+  };
   return {
     pop: (n, mult) => tone(280 + n * 55 + mult * 70, 0.16 + n * 0.015, "triangle", 0.16),
     block: () => tone(120, 0.14, "sawtooth", 0.12),
+    errSoft,
+    turn: (p) => tone(p === 0 ? 520 : 380, 0.12, "triangle", 0.09),
     win: () => { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => tone(f, 0.22, "triangle", 0.18), i * 90)); },
   };
 }
 
 // ---------- a single hex tile drawn at origin ----------
-function HexShape({ color, dir, faded }) {
-  const c = COLORS[color];
-  const corners = [];
+function HexShape({ color, dir, faded }: { color?: string; dir?: string; faded?: boolean }) {
+  const corners: string[] = [];
   for (let i = 0; i < 6; i++) {
     const a = (Math.PI / 180) * 60 * i;
     corners.push(`${(SIZE * 0.94 * Math.cos(a)).toFixed(2)},${(SIZE * 0.94 * Math.sin(a)).toFixed(2)}`);
   }
   const pts = corners.join(" ");
-  if (faded) {
+  if (faded || !color || !dir) {
     return <polygon points={pts} fill="none" stroke="rgba(255,255,255,.07)" strokeWidth="1.4" />;
   }
+  const c = COLORS[color];
   const d = DIRS[dir];
   const A = SIZE * 0.46, hw = SIZE * 0.36, hy = SIZE * 0.0, sw = SIZE * 0.135, sb = SIZE * 0.46;
   const arrow = `M0,${-A} L${hw},${hy} L${sw},${hy} L${sw},${sb} L${-sw},${sb} L${-sw},${hy} L${-hw},${hy} Z`;
@@ -259,15 +296,18 @@ export default function HexBlast() {
   const [level, setLevel] = useState(1);
   const [sizeR, setSizeR] = useState(3);
   const [diffIdx, setDiffIdx] = useState(1);
+  const [mode, setMode] = useState<"solo" | "2p">("solo");
   const [first] = useState(() => genBoardDiff(3, 1, DIFFS[1]));
   const [board, setBoard] = useState(() => first.board);
   const [metric, setMetric] = useState(() => ({ axB: first.axB, minAxis: first.minAxis, tiles: first.tiles }));
   const [score, setScore] = useState(0);
+  const [pScores, setPScores] = useState<[number, number]>([0, 0]);
+  const [turn, setTurn] = useState<0 | 1>(0);
   const [moves, setMoves] = useState(0);
   const [best, setBest] = useState(0);
   const [bestChain, setBestChain] = useState(1);
-  const [flying, setFlying] = useState([]);
-  const [pops, setPops] = useState([]);
+  const [flying, setFlying] = useState<any[]>([]);
+  const [pops, setPops] = useState<any[]>([]);
   const [chain, setChain] = useState({ mult: 1, expire: 0, barKey: 0 });
   const [won, setWon] = useState(false);
   const [help, setHelp] = useState(false);
@@ -275,13 +315,16 @@ export default function HexBlast() {
 
   const boardRef = useRef(board); boardRef.current = board;
   const chainRef = useRef(chain); chainRef.current = chain;
-  const histRef = useRef([]);
+  const modeRef = useRef(mode); modeRef.current = mode;
+  const turnRef = useRef(turn); turnRef.current = turn;
+  const histRef = useRef<any[]>([]);
   const idRef = useRef(0);
-  const tileRefs = useRef(new Map());
+  const tileRefs = useRef(new Map<string, SVGGElement>());
+  const animLockRef = useRef(false);
   const soundRef = useRef(sound); soundRef.current = sound;
   const blip = useBlips(soundRef);
 
-  // chain decay
+  // chain decay (solo only)
   useEffect(() => {
     const id = setInterval(() => {
       if (chainRef.current.mult > 1 && Date.now() > chainRef.current.expire) {
@@ -291,7 +334,7 @@ export default function HexBlast() {
     return () => clearInterval(id);
   }, []);
 
-  const startLevel = useCallback((lvl, R, di) => {
+  const startLevel = useCallback((lvl, R, di, m: "solo" | "2p" = modeRef.current) => {
     const res = genBoardDiff(R, lvl, DIFFS[di]);
     setBoard(res.board);
     setMetric({ axB: res.axB, minAxis: res.minAxis, tiles: res.tiles });
@@ -300,12 +343,20 @@ export default function HexBlast() {
     setChain({ mult: 1, expire: 0, barKey: 0 });
     histRef.current = [];
     setFlying([]); setPops([]);
+    if (m === "2p") {
+      setPScores([0, 0]);
+      setTurn(0);
+      setScore(0);
+    } else {
+      setScore(0);
+    }
   }, []);
 
   const newBoard = () => startLevel(level, sizeR, diffIdx);
   const nextLevel = () => { const n = level + 1; setLevel(n); startLevel(n, sizeR, diffIdx); };
   const chooseSize = (R) => { setSizeR(R); startLevel(level, R, diffIdx); };
   const chooseDiff = (di) => { setDiffIdx(di); startLevel(level, sizeR, di); };
+  const chooseMode = (m: "solo" | "2p") => { setMode(m); startLevel(level, sizeR, diffIdx, m); };
 
   const undo = () => {
     const h = histRef.current.pop();
@@ -314,6 +365,8 @@ export default function HexBlast() {
     setScore(h.score);
     setMoves(h.moves);
     setWon(false);
+    if (h.pScores) setPScores(h.pScores);
+    if (typeof h.turn === "number") setTurn(h.turn);
   };
 
   // geometry / viewBox from the full board region (stable layout)
@@ -327,17 +380,17 @@ export default function HexBlast() {
   });
   const pad = SIZE * 1.5;
   const vb = [minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2];
-  const span = Math.hypot(vb[2], vb[3]);
 
   const launch = (q, r) => {
     if (won) return;
+    if (animLockRef.current) return; // ignore taps mid-animation
     const b = boardRef.current;
     const tile = b.get(key(q, r));
     if (!tile) return;
     const d = DIRS[tile.dir];
 
     // sweep from tapped cell toward edge
-    const group = [];
+    const group: any[] = [];
     let cq = q, cr = r, blocked = false;
     while (cubeMax(cq, cr) <= R) {
       const t = b.get(key(cq, cr));
@@ -349,36 +402,47 @@ export default function HexBlast() {
     }
 
     if (blocked || group.length === 0) {
-      blip.block();
+      // subtle error tone + lean-and-reflect fold animation
+      blip.errSoft();
       const el = tileRefs.current.get(key(q, r));
-      if (el) el.animate(
-        [{ transform: "translate(0,0)" }, { transform: "translate(3px,0)" },
-         { transform: "translate(-3px,0)" }, { transform: "translate(2px,0)" },
-         { transform: "translate(0,0)" }],
-        { duration: 220, easing: "ease-in-out" });
+      if (el) {
+        const u = dirUnitPx(d);
+        // first half: fold ~40% of a step forward (45deg lean). second half: snap back.
+        const lean = STEP_PX * 0.4;
+        el.animate(
+          [
+            { transform: "translate(0px,0px) rotate(0deg)", offset: 0 },
+            { transform: `translate(${u.x * lean}px,${u.y * lean}px) rotate(45deg)`, offset: 0.45 },
+            { transform: `translate(${u.x * lean * 0.7}px,${u.y * lean * 0.7}px) rotate(30deg)`, offset: 0.6 },
+            { transform: "translate(0px,0px) rotate(0deg)", offset: 1 },
+          ],
+          { duration: 360, easing: "cubic-bezier(.4,.0,.3,1)" }
+        );
+      }
       return;
     }
 
     // ---- success: scoring ----
     const now = Date.now();
     const prev = chainRef.current;
-    const mult = now < prev.expire ? prev.mult + 1 : 1;
+    // chain disabled in two-player mode
+    const mult = modeRef.current === "2p" ? 1 : (now < prev.expire ? prev.mult + 1 : 1);
     const n = group.length;
     const sameColor = group.every((g) => g.color === group[0].color);
     const diag = isDiagonal(tile.dir);
 
     const base = n * 12;
-    const sweepBonus = n > 1 ? n * n * 6 : 0;                       // length
-    const colorBonus = sameColor && n > 1 ? n * n * 10 : 0;         // same-color run
-    const diagBonus = sameColor && diag && n >= 2 ? n * n * 16 : 0; // same-color diagonal
+    const sweepBonus = n > 1 ? n * n * 6 : 0;
+    const colorBonus = sameColor && n > 1 ? n * n * 10 : 0;
+    const diagBonus = sameColor && diag && n >= 2 ? n * n * 16 : 0;
     const gained = (base + sweepBonus + colorBonus + diagBonus) * mult;
 
-    const tags = [];
+    const tags: string[] = [];
     if (n > 1) tags.push(`${n}× SWEEP`);
     if (diagBonus) tags.push("◆ DIAGONAL");
     else if (colorBonus) tags.push("PURE COLOR");
 
-    histRef.current.push({ board: new Map(b), score, moves });
+    histRef.current.push({ board: new Map(b), score, moves, pScores: [...pScores] as [number, number], turn });
     if (histRef.current.length > 40) histRef.current.shift();
 
     // remove from board
@@ -386,25 +450,52 @@ export default function HexBlast() {
     group.forEach((g) => nb.delete(key(g.q, g.r)));
     setBoard(nb);
     setMoves((m) => m + 1);
-    setScore((s) => { const ns = s + gained; setBest((bs) => Math.max(bs, ns)); return ns; });
-    setChain({ mult, expire: now + CHAIN_WINDOW, barKey: prev.barKey + 1 });
-    setBestChain((bc) => Math.max(bc, mult));
+
+    if (modeRef.current === "2p") {
+      setPScores((ps) => {
+        const next = [...ps] as [number, number];
+        next[turnRef.current] += gained;
+        return next;
+      });
+      setChain({ mult: 1, expire: 0, barKey: 0 });
+    } else {
+      setScore((s) => { const ns = s + gained; setBest((bs) => Math.max(bs, ns)); return ns; });
+      setChain({ mult, expire: now + CHAIN_WINDOW, barKey: prev.barKey + 1 });
+      setBestChain((bc) => Math.max(bc, mult));
+    }
     blip.pop(n, mult);
 
-    // fly-out animation
+    // ---- fold-fly animation: each tile tumbles cell-by-cell off the board ----
     const u = dirUnitPx(d);
-    const dist = span + SIZE * 4;
+    animLockRef.current = true;
     const newFly = group.map((g, i) => {
       const p = px(g.q, g.r);
-      return { id: ++idRef.current, x: p.x, y: p.y, color: g.color, dir: g.dir, dx: u.x * dist, dy: u.y * dist, delay: i * 26 };
+      const steps = stepsToEdge(g.q, g.r, g.dir, R);
+      return { id: ++idRef.current, x: p.x, y: p.y, color: g.color, dir: g.dir, ux: u.x, uy: u.y, steps, delay: i * 60 };
     });
     setFlying((f) => [...f, ...newFly]);
+
+    // estimate when all fold anims finish, then advance turn / unlock
+    const maxSteps = Math.max(...newFly.map((f) => f.steps));
+    const lastDelay = newFly[newFly.length - 1]?.delay ?? 0;
+    const totalAnim = lastDelay + maxSteps * FOLD_MS + 40;
+    setTimeout(() => {
+      animLockRef.current = false;
+      if (modeRef.current === "2p" && nb.size > 0) {
+        setTurn((t) => {
+          const nxt = (t === 0 ? 1 : 0) as 0 | 1;
+          blip.turn(nxt);
+          return nxt;
+        });
+      }
+    }, totalAnim);
 
     // score popup at tapped tile
     const tp = px(q, r);
     const popId = ++idRef.current;
+    const popPlayer = modeRef.current === "2p" ? turnRef.current : -1;
     setPops((ps) => [...ps, {
-      id: popId, x: tp.x, y: tp.y, gained, mult, tags, hot: !!diagBonus,
+      id: popId, x: tp.x, y: tp.y, gained, mult, tags, hot: !!diagBonus, player: popPlayer,
     }]);
     setTimeout(() => setPops((ps) => ps.filter((p) => p.id !== popId)), 950);
 
@@ -412,13 +503,15 @@ export default function HexBlast() {
     if (nb.size === 0) { setTimeout(() => { setWon(true); blip.win(); }, 350); }
   };
 
-  // remove flying tiles after their animation
   const flyDone = (id) => setFlying((f) => f.filter((x) => x.id !== id));
 
-  const chainAlive = chain.mult > 1 && Date.now() < chain.expire;
+  const chainAlive = mode === "solo" && chain.mult > 1 && Date.now() < chain.expire;
+  const winner = mode === "2p" && won
+    ? (pScores[0] === pScores[1] ? "tie" : (pScores[0] > pScores[1] ? 0 : 1))
+    : null;
 
   return (
-    <div style={styles.root}>
+    <div style={{ ...styles.root, transition: "box-shadow .25s", boxShadow: mode === "2p" ? `inset 0 0 0 3px ${PLAYERS[turn].soft}` : undefined }}>
       <style>{css}</style>
 
       {/* gradient defs */}
@@ -441,7 +534,7 @@ export default function HexBlast() {
             <span style={styles.logoMark}><Zap size={20} strokeWidth={2.6} /></span>
             <div>
               <h1 style={styles.title}>HEX&nbsp;BLAST</h1>
-              <p style={styles.sub}>sweep · chain · clear the grid</p>
+              <p style={styles.sub}>sweep · fold · clear the grid</p>
             </div>
           </div>
           <div style={styles.headBtns}>
@@ -454,25 +547,72 @@ export default function HexBlast() {
           </div>
         </header>
 
-        {/* stat strip */}
-        <div style={styles.stats}>
-          <Stat label="LEVEL" value={level} />
-          <Stat label="SCORE" value={score.toLocaleString()} big />
-          <Stat label="MOVES" value={moves} />
-          <Stat label="BEST ×" value={bestChain} accent={COLORS.amber.base} />
+        {/* mode toggle */}
+        <div style={styles.sizeRow}>
+          <span style={styles.sizeLbl}>MODE</span>
+          <div style={styles.seg}>
+            <button
+              onClick={() => chooseMode("solo")}
+              style={{ ...styles.segBtn, ...(mode === "solo" ? styles.segBtnOn : {}), display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <User size={14} /> Solo
+            </button>
+            <button
+              onClick={() => chooseMode("2p")}
+              style={{ ...styles.segBtn, ...(mode === "2p" ? styles.segBtnOn : {}), display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Users size={14} /> 2 Player
+            </button>
+          </div>
         </div>
 
-        {/* chain meter */}
-        <div style={styles.chainWrap}>
-          <div style={{ ...styles.chainLabel, opacity: chainAlive ? 1 : 0.35, color: chainAlive ? COLORS.amber.base : "#7d7a86" }}>
-            CHAIN&nbsp;×{chain.mult}
+        {/* stat strip — solo */}
+        {mode === "solo" && (
+          <div style={styles.stats}>
+            <Stat label="LEVEL" value={level} />
+            <Stat label="SCORE" value={score.toLocaleString()} big />
+            <Stat label="MOVES" value={moves} />
+            <Stat label="BEST ×" value={bestChain} accent={COLORS.amber.base} />
           </div>
-          <div style={styles.chainTrack}>
-            {chainAlive && (
-              <div key={chain.barKey} style={styles.chainBar} />
-            )}
+        )}
+
+        {/* stat strip — 2 player */}
+        {mode === "2p" && (
+          <div style={styles.players}>
+            {PLAYERS.map((p, i) => {
+              const active = turn === i && !won;
+              return (
+                <div key={p.name} style={{
+                  ...styles.player,
+                  borderColor: active ? p.glow : "rgba(255,255,255,.08)",
+                  background: active ? p.soft : "rgba(255,255,255,.03)",
+                  boxShadow: active ? `0 0 0 1px ${p.glow}, 0 6px 22px ${p.soft}` : "none",
+                  transform: active ? "translateY(-1px)" : "none",
+                }}>
+                  <div style={{ ...styles.playerName, color: active ? p.glow : "#857f96" }}>
+                    <span style={{ ...styles.dot, background: p.glow, boxShadow: active ? `0 0 10px ${p.glow}` : "none" }} />
+                    {p.name}{active ? " · YOUR TURN" : ""}
+                  </div>
+                  <div style={{ ...styles.playerScore, color: active ? "#fff" : "#cdc7da" }}>
+                    {pScores[i].toLocaleString()}
+                  </div>
+                </div>
+              );
+            })}
           </div>
-        </div>
+        )}
+
+        {/* chain meter (solo only) */}
+        {mode === "solo" && (
+          <div style={styles.chainWrap}>
+            <div style={{ ...styles.chainLabel, opacity: chainAlive ? 1 : 0.35, color: chainAlive ? COLORS.amber.base : "#7d7a86" }}>
+              CHAIN&nbsp;×{chain.mult}
+            </div>
+            <div style={styles.chainTrack}>
+              {chainAlive && (
+                <div key={chain.barKey} style={styles.chainBar} />
+              )}
+            </div>
+          </div>
+        )}
 
         {/* difficulty */}
         <div style={styles.sizeRow}>
@@ -522,7 +662,14 @@ export default function HexBlast() {
         </div>
 
         {/* board */}
-        <div style={styles.boardWrap}>
+        <div style={{
+          ...styles.boardWrap,
+          borderColor: mode === "2p" ? PLAYERS[turn].glow : "rgba(255,255,255,.06)",
+          boxShadow: mode === "2p"
+            ? `inset 0 1px 0 rgba(255,255,255,.05), 0 0 0 1px ${PLAYERS[turn].soft}, 0 12px 40px ${PLAYERS[turn].soft}`
+            : "inset 0 1px 0 rgba(255,255,255,.05)",
+          transition: "border-color .25s, box-shadow .25s",
+        }}>
           <svg viewBox={vb.join(" ")} style={styles.svg} preserveAspectRatio="xMidYMid meet">
             {/* faint empty grid */}
             {region.map(({ q, r }) => {
@@ -534,13 +681,13 @@ export default function HexBlast() {
               );
             })}
             {/* live tiles */}
-            {[...board.entries()].map(([k, t]) => {
+            {[...board.entries()].map(([k, t]: any) => {
               const [q, r] = k.split(",").map(Number);
               const p = px(q, r);
               return (
                 <g
                   key={k}
-                  ref={(el) => { if (el) tileRefs.current.set(k, el); else tileRefs.current.delete(k); }}
+                  ref={(el) => { if (el) tileRefs.current.set(k, el as SVGGElement); else tileRefs.current.delete(k); }}
                   transform={`translate(${p.x},${p.y})`}
                   className="tile"
                   onClick={() => launch(q, r)}
@@ -549,34 +696,45 @@ export default function HexBlast() {
                 </g>
               );
             })}
-            {/* flying tiles */}
-            {flying.map((f) => (
-              <g key={f.id} transform={`translate(${f.x},${f.y})`} style={{ pointerEvents: "none" }}>
-                <g
-                  ref={(el) => {
-                    if (!el || el.dataset.run) return;
-                    el.dataset.run = "1";
-                    const anim = el.animate(
-                      [
-                        { transform: "translate(0px,0px) scale(1)", opacity: 1 },
-                        { opacity: 1, offset: 0.55 },
-                        { transform: `translate(${f.dx}px,${f.dy}px) scale(.35)`, opacity: 0 },
-                      ],
-                      { duration: 540, delay: f.delay, easing: "cubic-bezier(.45,0,.85,.35)", fill: "forwards" }
-                    );
-                    anim.onfinish = () => flyDone(f.id);
-                  }}
-                >
-                  <HexShape color={f.color} dir={f.dir} />
+            {/* flying / folding tiles */}
+            {flying.map((f) => {
+              const kfs: any[] = [];
+              for (let k = 0; k <= f.steps; k++) {
+                kfs.push({
+                  transform: `translate(${k * STEP_PX * f.ux}px, ${k * STEP_PX * f.uy}px) rotate(${k * 180}deg)`,
+                  opacity: k === f.steps ? 0 : 1,
+                  offset: k / f.steps,
+                });
+              }
+              return (
+                <g key={f.id} transform={`translate(${f.x},${f.y})`} style={{ pointerEvents: "none" }}>
+                  <g
+                    ref={(el) => {
+                      if (!el || (el as any).dataset.run) return;
+                      (el as any).dataset.run = "1";
+                      const anim = el.animate(kfs, {
+                        duration: f.steps * FOLD_MS,
+                        delay: f.delay,
+                        easing: "cubic-bezier(.5,.05,.4,1)",
+                        fill: "forwards",
+                      });
+                      anim.onfinish = () => flyDone(f.id);
+                    }}
+                  >
+                    <HexShape color={f.color} dir={f.dir} />
+                  </g>
                 </g>
-              </g>
-            ))}
+              );
+            })}
             {/* score popups */}
             {pops.map((p) => {
               const line2 = [...p.tags, p.mult > 1 ? `CHAIN ×${p.mult}` : null].filter(Boolean).join("  ·  ");
+              const baseColor = p.player === 0 ? PLAYERS[0].glow
+                              : p.player === 1 ? PLAYERS[1].glow
+                              : (p.hot ? COLORS.sun.base : "#fff");
               return (
                 <g key={p.id} transform={`translate(${p.x},${p.y})`} className="pop" style={{ pointerEvents: "none" }}>
-                  <text textAnchor="middle" y={-4} style={{ font: "700 18px 'Space Mono', monospace", fill: p.hot ? COLORS.sun.base : "#fff", paintOrder: "stroke", stroke: "rgba(0,0,0,.6)", strokeWidth: 3.5 }}>
+                  <text textAnchor="middle" y={-4} style={{ font: "700 18px 'Space Mono', monospace", fill: baseColor, paintOrder: "stroke", stroke: "rgba(0,0,0,.6)", strokeWidth: 3.5 }}>
                     +{p.gained.toLocaleString()}
                   </text>
                   {line2 && (
@@ -603,11 +761,29 @@ export default function HexBlast() {
           <div style={styles.card}>
             <div style={styles.cardBadge}><Zap size={26} strokeWidth={2.6} /></div>
             <h2 style={styles.cardTitle}>GRID CLEARED</h2>
-            <p style={styles.cardSub}>Level {level} done in {moves} moves</p>
-            <div style={styles.cardStats}>
-              <div><div style={styles.csVal}>{score.toLocaleString()}</div><div style={styles.csLbl}>SCORE</div></div>
-              <div><div style={styles.csVal}>×{bestChain}</div><div style={styles.csLbl}>BEST CHAIN</div></div>
-            </div>
+            {mode === "solo" ? (
+              <>
+                <p style={styles.cardSub}>Level {level} done in {moves} moves</p>
+                <div style={styles.cardStats}>
+                  <div><div style={styles.csVal}>{score.toLocaleString()}</div><div style={styles.csLbl}>SCORE</div></div>
+                  <div><div style={styles.csVal}>×{bestChain}</div><div style={styles.csLbl}>BEST CHAIN</div></div>
+                </div>
+              </>
+            ) : (
+              <>
+                <p style={{ ...styles.cardSub, color: winner === "tie" ? "#cdc7da" : PLAYERS[winner as number].glow, fontWeight: 700 }}>
+                  {winner === "tie" ? "IT'S A TIE" : `${PLAYERS[winner as number].name} WINS`}
+                </p>
+                <div style={styles.cardStats}>
+                  {PLAYERS.map((p, i) => (
+                    <div key={p.name}>
+                      <div style={{ ...styles.csVal, color: p.glow }}>{pScores[i].toLocaleString()}</div>
+                      <div style={styles.csLbl}>{p.name}</div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
             <button style={styles.cta} onClick={nextLevel}>Next level <ChevronRight size={18} /></button>
             <button style={styles.ghost} onClick={newBoard}>Replay this level</button>
           </div>
@@ -621,13 +797,13 @@ export default function HexBlast() {
             <button style={styles.close} onClick={() => setHelp(false)}><X size={18} /></button>
             <h2 style={styles.cardTitle}>HOW TO PLAY</h2>
             <ul style={styles.rules}>
-              <li><b>Tap a tile</b> — it flies off the board in the direction its arrow points.</li>
-              <li><b>Sweep combo:</b> any tile in its path pointing the <i>same</i> direction gets blasted off <i>with</i> it. Empty gaps are flown over freely.</li>
-              <li><b>Blockers:</b> a tile pointing a <i>different</i> direction stops the shot. Clear it first.</li>
+              <li><b>Tap a tile</b> — it folds cell-by-cell off the board in the direction its arrow points.</li>
+              <li><b>Sweep combo:</b> any tile in its path pointing the <i>same</i> direction tumbles off <i>with</i> it. Empty gaps are passed over freely.</li>
+              <li><b>Blocked:</b> a tile pointing a <i>different</i> direction stops the shot. The tapped tile leans forward, plays a soft error tone, and reflects back to its origin.</li>
               <li><b>Score:</b> big sweeps pay off fast — a 5-tile sweep is worth far more than five singles.</li>
-              <li><b>◆ Diagonal bonus:</b> sweep a run that's all <i>one color</i> along a <i>diagonal</i> for a big extra payout (a same-color run in any direction earns a smaller "pure color" bonus).</li>
-              <li><b>Chains:</b> fire again before the chain meter empties to stack ×2, ×3, ×4… on every point you earn.</li>
-              <li><b>Difficulty</b> is set by the <i>weakest of the three lane families</i> — vertical ↕, diagonal ╱, and diagonal ╲. The readout shows each one's blocked %, so there's no easy diagonal to escape through. Expert maximizes the weakest lane.</li>
+              <li><b>◆ Diagonal bonus:</b> sweep a run that's all <i>one color</i> along a <i>diagonal</i> for a big extra payout.</li>
+              <li><b>Chains (solo only):</b> fire again before the chain meter empties to stack ×2, ×3… on every point you earn.</li>
+              <li><b>2 Player:</b> players alternate turns — even on a blocked tap, your turn ends. No chain multiplier. Highest score when the grid clears wins.</li>
               <li><b>Goal:</b> clear every tile. Each board is always solvable.</li>
             </ul>
             <button style={styles.cta} onClick={() => setHelp(false)}>Got it</button>
@@ -638,7 +814,7 @@ export default function HexBlast() {
   );
 }
 
-function Stat({ label, value, big, accent }) {
+function Stat({ label, value, big, accent }: { label: string; value: any; big?: boolean; accent?: string }) {
   return (
     <div style={styles.stat}>
       <div style={styles.statLbl}>{label}</div>
@@ -650,7 +826,7 @@ function Stat({ label, value, big, accent }) {
 const css = `
 @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Space+Mono:wght@400;700&display=swap');
 *{box-sizing:border-box;}
-.tile{cursor:pointer;transition:filter .12s;}
+.tile{cursor:pointer;transition:filter .12s;transform-origin:center;transform-box:fill-box;}
 .tile:hover{filter:brightness(1.12) drop-shadow(0 0 6px rgba(255,255,255,.25));}
 .tile:active{filter:brightness(.92);}
 .pop{animation:popUp .95s ease-out forwards;}
@@ -663,7 +839,7 @@ const css = `
 @keyframes popRise{from{transform:translateY(6px);}to{transform:translateY(-26px);}}
 `;
 
-const styles = {
+const styles: Record<string, React.CSSProperties> = {
   root: {
     minHeight: "100vh", width: "100%",
     background: "radial-gradient(1200px 700px at 50% -10%, #2a2440 0%, #16131f 45%, #0e0c14 100%)",
@@ -693,6 +869,25 @@ const styles = {
   stat: { textAlign: "center" },
   statLbl: { fontSize: 10, letterSpacing: 1.2, color: "#857f96", fontWeight: 600 },
   statVal: { fontFamily: "'Space Mono', monospace", fontWeight: 700, marginTop: 2 },
+  players: {
+    display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10,
+  },
+  player: {
+    borderRadius: 16, padding: "12px 14px",
+    border: "1px solid rgba(255,255,255,.08)",
+    transition: "background .25s, border-color .25s, box-shadow .25s, transform .25s",
+  },
+  playerName: {
+    fontSize: 11, letterSpacing: 1.2, fontWeight: 700,
+    display: "flex", alignItems: "center", gap: 6, transition: "color .25s",
+  },
+  dot: {
+    width: 8, height: 8, borderRadius: 8, display: "inline-block",
+  },
+  playerScore: {
+    fontFamily: "'Space Mono', monospace", fontWeight: 700, fontSize: 26, marginTop: 4,
+    transition: "color .25s",
+  },
   chainWrap: { display: "flex", alignItems: "center", gap: 12 },
   chainLabel: { fontSize: 13, fontWeight: 700, letterSpacing: 1, minWidth: 78, transition: "opacity .2s,color .2s" },
   chainTrack: { flex: 1, height: 8, borderRadius: 6, background: "rgba(255,255,255,.07)", overflow: "hidden" },
@@ -758,7 +953,7 @@ const styles = {
     border: "1px solid rgba(255,255,255,.12)", background: "rgba(255,255,255,.05)",
     color: "#cfc9dd", display: "grid", placeItems: "center", cursor: "pointer",
   },
-  rules: { textAlign: "left", margin: "8px 0 20px", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 11, fontSize: 14, color: "#cdc7da", lineHeight: 1.45 },
+  rules: { textAlign: "left", margin: "8px 0 20px", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 11, fontSize: 14, color: "#cdc7da", lineHeight: 1.45 } as React.CSSProperties,
 };
 
 // keyframes that can't live in inline styles
