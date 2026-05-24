@@ -157,7 +157,39 @@ function genBoardBalanced(R, groups) {
     for (const c of ray) { board.set(key(c.q, c.r), { color, dir: dName }); axc[ax]++; }
     placed++;
   }
+  packBoard(board, R);
   return board;
+}
+
+// fill every remaining empty cell with a single tile whose exit path is clear
+// of different-direction tiles. Maintains the constructive solvability invariant:
+// packing tiles are placed last, so launching them first in reverse-placement
+// order leaves the originally-generated board intact.
+function packBoard(board, R) {
+  const empties = [];
+  for (let q = -R; q <= R; q++)
+    for (let r = -R; r <= R; r++)
+      if (cubeMax(q, r) <= R && !board.has(key(q, r))) empties.push({ q, r });
+  // shuffle so the fill order doesn't bias toward a corner
+  for (let i = empties.length - 1; i > 0; i--) {
+    const j = rnd(i + 1);
+    [empties[i], empties[j]] = [empties[j], empties[i]];
+  }
+  for (const { q, r } of empties) {
+    const dirs = DIR_KEYS.slice().sort(() => Math.random() - 0.5);
+    for (const dName of dirs) {
+      const d = DIRS[dName];
+      let cq = q + d.dq, cr = r + d.dr, blocked = false;
+      while (cubeMax(cq, cr) <= R) {
+        const t = board.get(key(cq, cr));
+        if (t && t.dir !== dName) { blocked = true; break; }
+        cq += d.dq; cr += d.dr;
+      }
+      if (blocked) continue;
+      board.set(key(q, r), { color: COLOR_KEYS[rnd(6)], dir: dName });
+      break;
+    }
+  }
 }
 
 // a tile can launch iff nothing of a DIFFERENT direction sits on its path to the edge
