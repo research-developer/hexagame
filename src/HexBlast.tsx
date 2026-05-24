@@ -58,42 +58,6 @@ function dirUnitPx(d) {
 }
 const rnd = (n) => Math.floor(Math.random() * n);
 
-// ---------- guaranteed-solvable generator (reverse construction) ----------
-function genBoard(R, targetGroups) {
-  const cells = allCells(R);
-  const inB = (q, r) => cubeMax(q, r) <= R;
-  const board = new Map();
-  let tries = 0;
-  let placed = 0;
-  while (placed < targetGroups && tries < targetGroups * 60) {
-    tries++;
-    const dName = DIR_KEYS[rnd(6)];
-    const d = DIRS[dName];
-    const start = cells[rnd(cells.length)];
-    const k = 1 + rnd(4);
-    const ray = [];
-    let cq = start.q, cr = start.r, ok = true;
-    for (let i = 0; i < k; i++) {
-      if (!inB(cq, cr) || board.has(key(cq, cr))) { ok = false; break; }
-      ray.push({ q: cq, r: cr });
-      cq += d.dq; cr += d.dr;
-    }
-    if (!ok) continue;
-    // exit path toward edge must hold no DIFFERENT-direction tile right now
-    let eq = cq, er = cr, blocked = false;
-    while (inB(eq, er)) {
-      const t = board.get(key(eq, er));
-      if (t && t.dir !== dName) { blocked = true; break; }
-      eq += d.dq; er += d.dr;
-    }
-    if (blocked) continue;
-    const color = COLOR_KEYS[rnd(6)];
-    for (const c of ray) board.set(key(c.q, c.r), { color, dir: dName });
-    placed++;
-  }
-  return board;
-}
-
 const SIZES = [
   { R: 3, label: "S" },
   { R: 4, label: "M" },
@@ -109,86 +73,56 @@ const isDiagonal = (dir) => dir === "NE" || dir === "SE" || dir === "SW" || dir 
 //   D2 ( ╲  diagonal)      : SE / NW
 const AXIS = { N: "V", S: "V", NE: "D1", SW: "D1", SE: "D2", NW: "D2" };
 const AXES = ["V", "D1", "D2"];
-const AXIS_DIRS = { V: ["N", "S"], D1: ["NE", "SW"], D2: ["SE", "NW"] };
 const AXIS_GLYPH = { V: "↕", D1: "╱", D2: "╲" };
 
 // Difficulty is driven by the WEAKEST lane family's blocked %, so a board can't
 // hide an easy diagonal escape behind a high pooled average.
 const DIFFS = [
-  { label: "Easy",   density: 0.45, lo: 0.00, hi: 0.20, expert: false },
-  { label: "Med",    density: 0.62, lo: 0.20, hi: 0.38, expert: false },
-  { label: "Hard",   density: 0.74, lo: 0.38, hi: 0.54, expert: false },
-  { label: "Expert", density: 0.84, lo: 0.54, hi: 1.00, expert: true },
+  { label: "Easy",   lo: 0.00, hi: 0.30, expert: false },
+  { label: "Med",    lo: 0.30, hi: 0.45, expert: false },
+  { label: "Hard",   lo: 0.45, hi: 0.60, expert: false },
+  { label: "Expert", lo: 0.60, hi: 1.00, expert: true  },
 ];
 const DIFF_COLOR = ["#34d36b", "#ffd23f", "#ff9d2e", "#ff4d4d"];
-const groupsFor = (R, lvl, band) => Math.floor(cellCount(R) * band.density) + lvl * 2;
 
-// solvable generator, biased to balance tiles across the three lane families
-function genBoardBalanced(R, groups) {
-  const cells = allCells(R);
-  const inB = (q, r) => cubeMax(q, r) <= R;
-  const board = new Map();
-  const axc = { V: 0, D1: 0, D2: 0 };
-  let tries = 0, placed = 0;
-  while (placed < groups && tries < groups * 80) {
-    tries++;
-    // prefer an underused axis so every lane family gets crossing traffic
-    const ax = [...AXES].sort((a, b) => axc[a] - axc[b])[rnd(2)];
-    const dName = AXIS_DIRS[ax][rnd(2)];
-    const d = DIRS[dName];
-    const start = cells[rnd(cells.length)];
-    const k = 1 + rnd(4);
-    const ray = [];
-    let cq = start.q, cr = start.r, ok = true;
-    for (let i = 0; i < k; i++) {
-      if (!inB(cq, cr) || board.has(key(cq, cr))) { ok = false; break; }
-      ray.push({ q: cq, r: cr });
-      cq += d.dq; cr += d.dr;
-    }
-    if (!ok) continue;
-    let eq = cq, er = cr, blocked = false;
-    while (inB(eq, er)) {
-      const t = board.get(key(eq, er));
-      if (t && t.dir !== dName) { blocked = true; break; }
-      eq += d.dq; er += d.dr;
-    }
-    if (blocked) continue;
-    const color = COLOR_KEYS[rnd(6)];
-    for (const c of ray) { board.set(key(c.q, c.r), { color, dir: dName }); axc[ax]++; }
-    placed++;
-  }
-  packBoard(board, R);
-  return board;
-}
-
-// fill every remaining empty cell with a single tile whose exit path is clear
-// of different-direction tiles. Maintains the constructive solvability invariant:
-// packing tiles are placed last, so launching them first in reverse-placement
-// order leaves the originally-generated board intact.
+// Pure greedy pack from an empty board: each step places a tile in the empty
+// cell with the fewest valid directions (ties broken at random), with a random
+// direction chosen from that cell's valid set. Because every tile is placed
+// with its exit path already clear of different-direction tiles given the
+// current board, the constructive-solvability invariant holds: launching in
+// reverse-placement order leaves every prior tile's exit unblocked.
+//
+// Empirically this fills every cell on every attempt across all board sizes
+// (R=3..6), so the board always spawns fully packed.
 function packBoard(board, R) {
-  const empties = [];
-  for (let q = -R; q <= R; q++)
-    for (let r = -R; r <= R; r++)
-      if (cubeMax(q, r) <= R && !board.has(key(q, r))) empties.push({ q, r });
-  // shuffle so the fill order doesn't bias toward a corner
-  for (let i = empties.length - 1; i > 0; i--) {
-    const j = rnd(i + 1);
-    [empties[i], empties[j]] = [empties[j], empties[i]];
-  }
-  for (const { q, r } of empties) {
-    const dirs = DIR_KEYS.slice().sort(() => Math.random() - 0.5);
-    for (const dName of dirs) {
-      const d = DIRS[dName];
-      let cq = q + d.dq, cr = r + d.dr, blocked = false;
-      while (cubeMax(cq, cr) <= R) {
-        const t = board.get(key(cq, cr));
-        if (t && t.dir !== dName) { blocked = true; break; }
-        cq += d.dq; cr += d.dr;
+  const total = cellCount(R);
+  while (board.size < total) {
+    let bestList: { q: number; r: number; v: string[] }[] = [];
+    let bestLen = 7;
+    for (let q = -R; q <= R; q++) {
+      for (let r = -R; r <= R; r++) {
+        if (cubeMax(q, r) > R) continue;
+        if (board.has(key(q, r))) continue;
+        const v: string[] = [];
+        for (const dName of DIR_KEYS) {
+          const d = DIRS[dName];
+          let cq = q + d.dq, cr = r + d.dr, bad = false;
+          while (cubeMax(cq, cr) <= R) {
+            const t = board.get(key(cq, cr));
+            if (t && t.dir !== dName) { bad = true; break; }
+            cq += d.dq; cr += d.dr;
+          }
+          if (!bad) v.push(dName);
+        }
+        if (v.length === 0) continue;
+        if (v.length < bestLen) { bestLen = v.length; bestList = [{ q, r, v }]; }
+        else if (v.length === bestLen) bestList.push({ q, r, v });
       }
-      if (blocked) continue;
-      board.set(key(q, r), { color: COLOR_KEYS[rnd(6)], dir: dName });
-      break;
     }
+    if (bestList.length === 0) return; // unpackable cell remains
+    const pick = bestList[rnd(bestList.length)];
+    const dName = pick.v[rnd(pick.v.length)];
+    board.set(key(pick.q, pick.r), { color: COLOR_KEYS[rnd(6)], dir: dName });
   }
 }
 
@@ -220,22 +154,35 @@ function metrics(board, R) {
   const minAxis = Math.min(axB.V, axB.D1, axB.D2);
   return { overall: total ? 1 - free / total : 0, axB, minAxis, tiles: total };
 }
-// generate solvable boards; pick by weakest-lane blocked %. Expert = maximize it.
+// Sample N fully-packed boards via packBoard, then pick the one whose weakest-
+// lane blocked % best fits the requested difficulty band (Expert maximizes it).
+// Level nudges the band slightly upward — each level makes the same band a bit
+// tougher within the difficulty's range.
 function genBoardDiff(R, lvl, band) {
-  let inBand = null, bestForExpert = null, bestExpVal = -1, closest = null, closestDist = Infinity;
-  for (let i = 0; i < 320; i++) {
-    const b = genBoardBalanced(R, groupsFor(R, lvl, band));
-    if (!b.size) continue;
+  const trials = band.expert ? 80 : 40;
+  const bump = Math.min(0.06 * (lvl - 1), Math.max(0, band.hi - band.lo - 0.05));
+  const lo = Math.min(band.lo + bump, band.hi - 0.02);
+  let best: any = null, bestScore = -Infinity;
+  for (let i = 0; i < trials; i++) {
+    const b = new Map();
+    packBoard(b, R);
     const m = metrics(b, R);
+    let diffScore;
     if (band.expert) {
-      if (m.minAxis > bestExpVal) { bestExpVal = m.minAxis; bestForExpert = { board: b, ...m }; }
-    } else if (m.minAxis >= band.lo && m.minAxis <= band.hi) {
-      inBand = { board: b, ...m }; break;
+      diffScore = m.minAxis;
+    } else if (m.minAxis >= lo && m.minAxis <= band.hi) {
+      diffScore = 1;
+    } else {
+      const dist = m.minAxis < lo ? (lo - m.minAxis) : (m.minAxis - band.hi);
+      diffScore = Math.max(0, 1 - dist * 3);
     }
-    const dist = m.minAxis < band.lo ? band.lo - m.minAxis : m.minAxis - band.hi;
-    if (dist < closestDist) { closestDist = dist; closest = { board: b, ...m }; }
+    if (diffScore > bestScore) {
+      bestScore = diffScore;
+      best = { board: b, ...m };
+      if (!band.expert && diffScore >= 1 && i >= 6) break;
+    }
   }
-  return band.expert ? bestForExpert : (inBand || closest);
+  return best;
 }
 
 // number of cells from (q,r) traveling in dir until fully off the board
