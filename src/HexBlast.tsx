@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { RotateCcw, Undo2, Volume2, VolumeX, HelpCircle, Zap, ChevronRight, X, User, Users } from "lucide-react";
+import { RotateCcw, Undo2, Volume2, VolumeX, HelpCircle, Zap, ChevronRight, X, User, Users, Bomb, Eye, Sparkles, Repeat } from "lucide-react";
 
 /*  HEX BLAST  — an original sweep-combo hex puzzle.
     Tap a tile: it folds cell-by-cell off the board in its arrow direction,
@@ -48,6 +48,56 @@ const PLAYERS = [
   { name: "P1", glow: "#3fc7ff", base: "#1aa7e6", deep: "#0a3a55", soft: "rgba(63,199,255,.18)" },
   { name: "P2", glow: "#ff6bd4", base: "#e63ab0", deep: "#5a0a48", soft: "rgba(255,107,212,.18)" },
 ];
+
+// ---------- 2P modifier cells & powerups ----------
+// Modifiers ride on top of a normal rainbow tile. They never change a tile's
+// dir/color, only relax sweep rules or boost score. None can strand a tile
+// that wasn't already strandable, so packBoard's solvability invariant holds.
+type Modifier = "star" | "crystal" | "wild" | "chain" | "sling";
+const MODIFIERS: { type: Modifier; glyph: string; tint: string; name: string; blurb: string }[] = [
+  { type: "star",    glyph: "★", tint: "#ffd23f", name: "Score Star",  blurb: "Sweep that touches it scores ×2." },
+  { type: "crystal", glyph: "◆", tint: "#3fd1ff", name: "Crystal",     blurb: "Sweep that touches it scores ×3." },
+  { type: "wild",    glyph: "◎", tint: "#f4f1fa", name: "Wildcard",    blurb: "Counts as any color in a sweep. Stays on the board." },
+  { type: "chain",   glyph: "⊕", tint: "#ff9d2e", name: "Chain Boost", blurb: "Take an extra turn after this move." },
+  { type: "sling",   glyph: "↠", tint: "#a45cff", name: "Slingshot",   blurb: "Sweep continues past the first blocker, taking one more matching tile." },
+];
+const MODIFIER_BY_TYPE: Record<Modifier, typeof MODIFIERS[number]> = MODIFIERS.reduce(
+  (acc, m) => ((acc[m.type] = m), acc), {} as any
+);
+const MODIFIER_DENSITY = 0.08;  // ~8% of tiles get a modifier in 2P
+const MODIFIER_MIN = 3;
+
+type PowerupType = "bomb" | "forecast" | "wildTap" | "freeTurn";
+type PowerupCounts = Record<PowerupType, number>;
+const POWERUPS: { type: PowerupType; name: string; blurb: string; tint: string }[] = [
+  { type: "bomb",     name: "Bomb",      blurb: "Clears that tile + its 6 neighbors. No sweep, no chain.", tint: "#ff4d4d" },
+  { type: "forecast", name: "Forecast",  blurb: "Preview the sweep. Doesn't consume your turn.",            tint: "#3fd1ff" },
+  { type: "wildTap",  name: "Wild Tap",  blurb: "Launch the next tap in any direction you choose.",         tint: "#ffd23f" },
+  { type: "freeTurn", name: "Free Turn", blurb: "Don't pass the turn after your next move.",                tint: "#34d36b" },
+];
+const STARTING_HAND: PowerupCounts = { bomb: 1, forecast: 1, wildTap: 1, freeTurn: 1 };
+const FORECAST_MS = 1600;
+const POWERUP_ICON: Record<PowerupType, any> = {
+  bomb: Bomb, forecast: Eye, wildTap: Sparkles, freeTurn: Repeat,
+};
+
+// Tag a fraction of tiles on a fully-packed board with random modifiers,
+// distributed roughly evenly across the 5 types. Safe to call after packBoard.
+function sprinkleModifiers(board: Map<string, any>, R: number) {
+  const total = cellCount(R);
+  const count = Math.min(board.size, Math.max(MODIFIER_MIN, Math.round(total * MODIFIER_DENSITY)));
+  const keys = [...board.keys()];
+  for (let i = keys.length - 1; i > 0; i--) {
+    const j = rnd(i + 1);
+    [keys[i], keys[j]] = [keys[j], keys[i]];
+  }
+  for (let i = 0; i < count; i++) {
+    const k = keys[i];
+    const t = board.get(k);
+    const mod = MODIFIERS[i % MODIFIERS.length].type;
+    board.set(k, { ...t, modifier: mod });
+  }
+}
 
 // ---------- hex geometry ----------
 const px = (q, r) => ({ x: SIZE * 1.5 * q, y: SIZE * Math.sqrt(3) * (r + q / 2) });
@@ -204,6 +254,67 @@ function stepsToEdge(q, r, dir, R) {
   return steps + 1; // one extra so the tile leaves the visible frame
 }
 
+// Compute the sweep group for a tap at (q0,r0) in direction `dir`.
+// Wildcard tiles (modifier: 'wild') count as matching color and join the
+// group. If the sweep would be blocked but a slingshot is in scope (on the
+// launched tile, on the sweep group, or adjacent to any of them), the sweep
+// continues past the first blocker and picks up the next encountered tile if
+// it also matches. Returns the swept group plus the set of modifiers (with
+// their cell keys) that the move touches.
+function computeSweep(
+  b: Map<string, any>, R: number, q0: number, r0: number, dir: string
+): { group: any[]; blocked: boolean; modKeys: { type: Modifier; q: number; r: number }[]; extended: boolean } {
+  const d = DIRS[dir];
+  const group: any[] = [];
+  let cq = q0, cr = r0, blocked = false;
+  let bq = 0, br = 0;
+  while (cubeMax(cq, cr) <= R) {
+    const t = b.get(key(cq, cr));
+    if (t) {
+      if (t.dir === dir || t.modifier === "wild") {
+        group.push({ q: cq, r: cr, ...t });
+      } else {
+        blocked = true; bq = cq; br = cr;
+        break;
+      }
+    }
+    cq += d.dq; cr += d.dr;
+  }
+  if (group.length === 0) return { group, blocked, modKeys: [], extended: false };
+
+  // scope = group ∪ 6 neighbors of each group tile
+  const scope = new Set<string>();
+  for (const g of group) {
+    scope.add(key(g.q, g.r));
+    for (const dn of DIR_KEYS) scope.add(key(g.q + DIRS[dn].dq, g.r + DIRS[dn].dr));
+  }
+  const modKeys: { type: Modifier; q: number; r: number }[] = [];
+  for (const sk of scope) {
+    const t = b.get(sk);
+    if (!t || !t.modifier) continue;
+    const [sq, sr] = sk.split(",").map(Number);
+    modKeys.push({ type: t.modifier, q: sq, r: sr });
+  }
+  // slingshot: extend past blocker, sweeping next matching tile
+  let extended = false;
+  if (blocked && modKeys.some((m) => m.type === "sling")) {
+    let nq = bq + d.dq, nr = br + d.dr;
+    while (cubeMax(nq, nr) <= R) {
+      const t = b.get(key(nq, nr));
+      if (t) {
+        if (t.dir === dir || t.modifier === "wild") {
+          group.push({ q: nq, r: nr, ...t });
+          extended = true;
+        }
+        break;
+      }
+      nq += d.dq; nr += d.dr;
+    }
+    blocked = false;
+  }
+  return { group, blocked, modKeys, extended };
+}
+
 // ---------- tiny web-audio juice ----------
 function useBlips(enabledRef) {
   const ctxRef = useRef(null);
@@ -255,7 +366,7 @@ function useBlips(enabledRef) {
 }
 
 // ---------- a single hex tile drawn at origin ----------
-function HexShape({ color, dir, faded }: { color?: string; dir?: string; faded?: boolean }) {
+function HexShape({ color, dir, faded, modifier }: { color?: string; dir?: string; faded?: boolean; modifier?: Modifier }) {
   const corners: string[] = [];
   for (let i = 0; i < 6; i++) {
     const a = (Math.PI / 180) * 60 * i;
@@ -269,6 +380,7 @@ function HexShape({ color, dir, faded }: { color?: string; dir?: string; faded?:
   const d = DIRS[dir];
   const A = SIZE * 0.46, hw = SIZE * 0.36, hy = SIZE * 0.0, sw = SIZE * 0.135, sb = SIZE * 0.46;
   const arrow = `M0,${-A} L${hw},${hy} L${sw},${hy} L${sw},${sb} L${-sw},${sb} L${-sw},${hy} L${-hw},${hy} Z`;
+  const mod = modifier ? MODIFIER_BY_TYPE[modifier] : null;
   return (
     <g>
       <polygon points={pts} fill={c.dark} transform="translate(0,2.5)" opacity="0.55" />
@@ -278,6 +390,14 @@ function HexShape({ color, dir, faded }: { color?: string; dir?: string; faded?:
       <g transform={`rotate(${d.angle})`}>
         <path d={arrow} fill={c.arrow} stroke="rgba(0,0,0,.18)" strokeWidth="0.8" strokeLinejoin="round" />
       </g>
+      {mod && (
+        <g transform={`translate(${SIZE * 0.52}, ${-SIZE * 0.52})`}>
+          <circle r={SIZE * 0.3} fill="rgba(20,16,32,.92)" stroke={mod.tint} strokeWidth={1.6} />
+          <text textAnchor="middle" y={SIZE * 0.14} style={{ font: `700 ${(SIZE * 0.42).toFixed(1)}px 'Space Mono', monospace`, fill: mod.tint, pointerEvents: "none" }}>
+            {mod.glyph}
+          </text>
+        </g>
+      )}
     </g>
   );
 }
@@ -303,10 +423,21 @@ export default function HexBlast() {
   const [help, setHelp] = useState(false);
   const [sound, setSound] = useState(true);
 
+  // 2P powerups: per-player inventory; one powerup armed at a time (active player)
+  const [pPowerups, setPPowerups] = useState<[PowerupCounts, PowerupCounts]>(() => [
+    { ...STARTING_HAND }, { ...STARTING_HAND },
+  ]);
+  const [armedPowerup, setArmedPowerup] = useState<PowerupType | null>(null);
+  const [wildPick, setWildPick] = useState<{ q: number; r: number } | null>(null);
+  const [forecast, setForecast] = useState<{ keys: string[]; until: number } | null>(null);
+
   const boardRef = useRef(board); boardRef.current = board;
   const chainRef = useRef(chain); chainRef.current = chain;
   const modeRef = useRef(mode); modeRef.current = mode;
   const turnRef = useRef(turn); turnRef.current = turn;
+  const armedRef = useRef(armedPowerup); armedRef.current = armedPowerup;
+  const wildPickRef = useRef(wildPick); wildPickRef.current = wildPick;
+  const pPowerupsRef = useRef(pPowerups); pPowerupsRef.current = pPowerups;
   const histRef = useRef<any[]>([]);
   const idRef = useRef(0);
   const tileRefs = useRef(new Map<string, SVGGElement>());
@@ -326,6 +457,7 @@ export default function HexBlast() {
 
   const startLevel = useCallback((lvl, R, di, m: "solo" | "2p" = modeRef.current) => {
     const res = genBoardDiff(R, lvl, DIFFS[di]);
+    if (m === "2p") sprinkleModifiers(res.board, R);
     setBoard(res.board);
     setMetric({ axB: res.axB, minAxis: res.minAxis, tiles: res.tiles });
     setMoves(0);
@@ -333,14 +465,27 @@ export default function HexBlast() {
     setChain({ mult: 1, expire: 0, barKey: 0 });
     histRef.current = [];
     setFlying([]); setPops([]);
+    setArmedPowerup(null);
+    setWildPick(null);
+    setForecast(null);
     if (m === "2p") {
       setPScores([0, 0]);
       setTurn(0);
       setScore(0);
+      setPPowerups([{ ...STARTING_HAND }, { ...STARTING_HAND }]);
     } else {
       setScore(0);
     }
   }, []);
+
+  // auto-expire forecast preview
+  useEffect(() => {
+    if (!forecast) return;
+    const remain = forecast.until - Date.now();
+    if (remain <= 0) { setForecast(null); return; }
+    const id = setTimeout(() => setForecast(null), remain);
+    return () => clearTimeout(id);
+  }, [forecast]);
 
   const newBoard = () => startLevel(level, sizeR, diffIdx);
   const nextLevel = () => { const n = level + 1; setLevel(n); startLevel(n, sizeR, diffIdx); };
@@ -357,6 +502,18 @@ export default function HexBlast() {
     setWon(false);
     if (h.pScores) setPScores(h.pScores);
     if (typeof h.turn === "number") setTurn(h.turn);
+    if (h.pPowerups) setPPowerups(h.pPowerups);
+    setArmedPowerup(null);
+    setWildPick(null);
+    setForecast(null);
+  };
+
+  const armPowerup = (type: PowerupType) => {
+    if (mode !== "2p" || won || animLockRef.current) return;
+    if (pPowerups[turn][type] <= 0) return;
+    setWildPick(null);
+    setForecast(null);
+    setArmedPowerup((cur) => (cur === type ? null : type));
   };
 
   // geometry / viewBox from the full board region (stable layout)
@@ -371,33 +528,49 @@ export default function HexBlast() {
   const pad = SIZE * 1.5;
   const vb = [minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2];
 
+  const snapshotHistory = (b: Map<string, any>) => {
+    histRef.current.push({
+      board: new Map(b), score, moves,
+      pScores: [...pScores] as [number, number], turn,
+      pPowerups: [{ ...pPowerups[0] }, { ...pPowerups[1] }] as [PowerupCounts, PowerupCounts],
+    });
+    if (histRef.current.length > 40) histRef.current.shift();
+  };
+
+  // tap dispatcher: route to armed-powerup action, wildTap picker, or normal launch
   const launch = (q, r) => {
     if (won) return;
-    if (animLockRef.current) return; // ignore taps mid-animation
+    if (animLockRef.current) return;
+    // cancel an open wildTap picker on any board tap that's not a picker arrow
+    if (wildPickRef.current) { setWildPick(null); return; }
+    const armed = armedRef.current;
+    if (armed === "bomb")     return executeBomb(q, r);
+    if (armed === "forecast") return executeForecast(q, r);
+    if (armed === "wildTap") {
+      if (!boardRef.current.has(key(q, r))) { setArmedPowerup(null); return; }
+      setWildPick({ q, r });
+      return;
+    }
+    // freeTurn falls through to normal launch (consumed on successful sweep)
+    launchTile(q, r);
+  };
+
+  const launchTile = (q: number, r: number, forceDir?: string) => {
     const b = boardRef.current;
     const tile = b.get(key(q, r));
     if (!tile) return;
-    const d = DIRS[tile.dir];
+    const dir = forceDir ?? tile.dir;
+    const d = DIRS[dir];
 
-    // sweep from tapped cell toward edge
-    const group: any[] = [];
-    let cq = q, cr = r, blocked = false;
-    while (cubeMax(cq, cr) <= R) {
-      const t = b.get(key(cq, cr));
-      if (t) {
-        if (t.dir === tile.dir) group.push({ q: cq, r: cr, ...t });
-        else { blocked = true; break; }
-      }
-      cq += d.dq; cr += d.dr;
-    }
+    const sweep = computeSweep(b, R, q, r, dir);
+    const { group, blocked, modKeys, extended } = sweep;
 
     if (blocked || group.length === 0) {
-      // subtle error tone + lean-and-reflect fold animation
+      // lean-and-reflect (wildTap not consumed on failure)
       blip.errSoft();
       const el = tileRefs.current.get(key(q, r));
       if (el) {
         const u = dirUnitPx(d);
-        // first half: fold ~40% of a step forward (45deg lean). second half: snap back.
         const lean = STEP_PX * 0.4;
         el.animate(
           [
@@ -412,33 +585,63 @@ export default function HexBlast() {
       return;
     }
 
-    // ---- success: scoring ----
+    // ---- success ----
     const now = Date.now();
     const prev = chainRef.current;
-    // chain disabled in two-player mode
-    const mult = modeRef.current === "2p" ? 1 : (now < prev.expire ? prev.mult + 1 : 1);
+    const chainMult = modeRef.current === "2p" ? 1 : (now < prev.expire ? prev.mult + 1 : 1);
     const n = group.length;
-    const diag = isDiagonal(tile.dir);
-
-    // color is fixed by direction, so any sweep is inherently same-color;
-    // the old colorBonus is folded into sweepBonus
+    const diag = isDiagonal(dir);
     const base = n * 12;
     const sweepBonus = n > 1 ? n * n * 16 : 0;
     const diagBonus = diag && n >= 2 ? n * n * 16 : 0;
-    const gained = (base + sweepBonus + diagBonus) * mult;
+
+    // collect modifier effects from in-scope modifiers
+    let modMult = 1, chains = 0;
+    for (const m of modKeys) {
+      if (m.type === "star") modMult *= 2;
+      else if (m.type === "crystal") modMult *= 3;
+      else if (m.type === "chain") chains++;
+    }
+    const gained = (base + sweepBonus + diagBonus) * chainMult * modMult;
 
     const tags: string[] = [];
     if (n > 1) tags.push(`${n}× SWEEP`);
     if (diagBonus) tags.push("◆ DIAGONAL");
+    if (extended) tags.push("↠ SLING");
+    if (modMult > 1) tags.push(`★ ×${modMult}`);
+    if (forceDir !== undefined && armedRef.current === "wildTap") tags.push("⚡ WILD");
 
-    histRef.current.push({ board: new Map(b), score, moves, pScores: [...pScores] as [number, number], turn });
-    if (histRef.current.length > 40) histRef.current.shift();
+    snapshotHistory(b);
 
-    // remove from board
+    // remove sweep tiles + strip any non-wild modifier triggered this turn
     const nb = new Map(b);
     group.forEach((g) => nb.delete(key(g.q, g.r)));
+    for (const m of modKeys) {
+      if (m.type === "wild") continue;
+      const k = key(m.q, m.r);
+      const t: any = nb.get(k);
+      if (!t) continue; // was in sweep group
+      const { modifier, ...rest } = t;
+      nb.set(k, rest);
+    }
     setBoard(nb);
-    setMoves((m) => m + 1);
+    setMoves((mv) => mv + 1);
+
+    // consume powerups
+    const wildTapUsed = forceDir !== undefined && armedRef.current === "wildTap";
+    const freeTurnUsed = modeRef.current === "2p" && armedRef.current === "freeTurn";
+    if (wildTapUsed || freeTurnUsed) {
+      setPPowerups((p) => {
+        const np = [{ ...p[0] }, { ...p[1] }] as [PowerupCounts, PowerupCounts];
+        if (wildTapUsed) np[turnRef.current].wildTap = Math.max(0, np[turnRef.current].wildTap - 1);
+        if (freeTurnUsed) np[turnRef.current].freeTurn = Math.max(0, np[turnRef.current].freeTurn - 1);
+        return np;
+      });
+    }
+    if (armedRef.current) setArmedPowerup(null);
+    setForecast(null);
+
+    const extraTurn = freeTurnUsed || chains > 0;
 
     if (modeRef.current === "2p") {
       setPScores((ps) => {
@@ -449,28 +652,27 @@ export default function HexBlast() {
       setChain({ mult: 1, expire: 0, barKey: 0 });
     } else {
       setScore((s) => { const ns = s + gained; setBest((bs) => Math.max(bs, ns)); return ns; });
-      setChain({ mult, expire: now + CHAIN_WINDOW, barKey: prev.barKey + 1 });
-      setBestChain((bc) => Math.max(bc, mult));
+      setChain({ mult: chainMult, expire: now + CHAIN_WINDOW, barKey: prev.barKey + 1 });
+      setBestChain((bc) => Math.max(bc, chainMult));
     }
-    blip.pop(n, mult);
+    blip.pop(n, chainMult);
 
-    // ---- fold-fly animation: each tile tumbles cell-by-cell off the board ----
+    // fold-fly animation
     const u = dirUnitPx(d);
     animLockRef.current = true;
     const newFly = group.map((g, i) => {
       const p = px(g.q, g.r);
-      const steps = stepsToEdge(g.q, g.r, g.dir, R);
-      return { id: ++idRef.current, x: p.x, y: p.y, color: g.color, dir: g.dir, ux: u.x, uy: u.y, steps, delay: i * 60 };
+      const steps = stepsToEdge(g.q, g.r, dir, R);
+      return { id: ++idRef.current, x: p.x, y: p.y, color: g.color, dir: g.dir, modifier: g.modifier, ux: u.x, uy: u.y, steps, delay: i * 60 };
     });
     setFlying((f) => [...f, ...newFly]);
 
-    // estimate when all fold anims finish, then advance turn / unlock
     const maxSteps = Math.max(...newFly.map((f) => f.steps));
     const lastDelay = newFly[newFly.length - 1]?.delay ?? 0;
     const totalAnim = lastDelay + maxSteps * FOLD_MS + 40;
     setTimeout(() => {
       animLockRef.current = false;
-      if (modeRef.current === "2p" && nb.size > 0) {
+      if (modeRef.current === "2p" && nb.size > 0 && !extraTurn) {
         setTurn((t) => {
           const nxt = (t === 0 ? 1 : 0) as 0 | 1;
           blip.turn(nxt);
@@ -479,17 +681,110 @@ export default function HexBlast() {
       }
     }, totalAnim);
 
-    // score popup at tapped tile
+    // score popup
     const tp = px(q, r);
     const popId = ++idRef.current;
     const popPlayer = modeRef.current === "2p" ? turnRef.current : -1;
     setPops((ps) => [...ps, {
-      id: popId, x: tp.x, y: tp.y, gained, mult, tags, hot: !!diagBonus, player: popPlayer,
+      id: popId, x: tp.x, y: tp.y, gained, mult: chainMult, tags, hot: !!diagBonus || modMult > 1, player: popPlayer,
     }]);
     setTimeout(() => setPops((ps) => ps.filter((p) => p.id !== popId)), 950);
 
-    // win check
     if (nb.size === 0) { setTimeout(() => { setWon(true); blip.win(); }, 350); }
+  };
+
+  const launchWildTap = (dir: string) => {
+    const wp = wildPickRef.current;
+    if (!wp) return;
+    setWildPick(null);
+    launchTile(wp.q, wp.r, dir);
+  };
+
+  const executeBomb = (q: number, r: number) => {
+    if (modeRef.current !== "2p") return;
+    const b = boardRef.current;
+    const cells: { q: number; r: number }[] = [];
+    if (cubeMax(q, r) <= R) cells.push({ q, r });
+    for (const dn of DIR_KEYS) {
+      const nq = q + DIRS[dn].dq, nr = r + DIRS[dn].dr;
+      if (cubeMax(nq, nr) <= R) cells.push({ q: nq, r: nr });
+    }
+    const affected = cells.filter((c) => b.has(key(c.q, c.r)));
+    if (affected.length === 0) { setArmedPowerup(null); return; }
+
+    snapshotHistory(b);
+    const nb = new Map(b);
+    affected.forEach((c) => nb.delete(key(c.q, c.r)));
+    setBoard(nb);
+    setMoves((mv) => mv + 1);
+
+    const gained = affected.length * 14;
+    setPScores((ps) => {
+      const next = [...ps] as [number, number];
+      next[turnRef.current] += gained;
+      return next;
+    });
+    setChain({ mult: 1, expire: 0, barKey: 0 });
+    setPPowerups((p) => {
+      const np = [{ ...p[0] }, { ...p[1] }] as [PowerupCounts, PowerupCounts];
+      np[turnRef.current].bomb = Math.max(0, np[turnRef.current].bomb - 1);
+      return np;
+    });
+    setArmedPowerup(null);
+    blip.pop(affected.length, 1);
+
+    // explode-outward: each tile pops one cell out from bomb center
+    const center = px(q, r);
+    animLockRef.current = true;
+    const newFly = affected.map((c, i) => {
+      const cp = px(c.q, c.r);
+      const dx = cp.x - center.x, dy = cp.y - center.y;
+      const dist = Math.hypot(dx, dy);
+      const ux = dist > 0.001 ? dx / dist : 0;
+      const uy = dist > 0.001 ? dy / dist : -1;
+      const t = b.get(key(c.q, c.r));
+      return { id: ++idRef.current, x: cp.x, y: cp.y, color: t.color, dir: t.dir, modifier: t.modifier, ux, uy, steps: 1, delay: i * 25 };
+    });
+    setFlying((f) => [...f, ...newFly]);
+    const totalAnim = (affected.length - 1) * 25 + FOLD_MS + 40;
+    setTimeout(() => {
+      animLockRef.current = false;
+      if (nb.size > 0) {
+        setTurn((t) => {
+          const nxt = (t === 0 ? 1 : 0) as 0 | 1;
+          blip.turn(nxt);
+          return nxt;
+        });
+      }
+    }, totalAnim);
+
+    const popId = ++idRef.current;
+    setPops((ps) => [...ps, {
+      id: popId, x: center.x, y: center.y, gained, mult: 1, tags: ["✸ BOMB"], hot: true, player: turnRef.current,
+    }]);
+    setTimeout(() => setPops((ps) => ps.filter((p) => p.id !== popId)), 950);
+
+    if (nb.size === 0) { setTimeout(() => { setWon(true); blip.win(); }, 350); }
+  };
+
+  const executeForecast = (q: number, r: number) => {
+    if (modeRef.current !== "2p") return;
+    const b = boardRef.current;
+    const tile = b.get(key(q, r));
+    setPPowerups((p) => {
+      const np = [{ ...p[0] }, { ...p[1] }] as [PowerupCounts, PowerupCounts];
+      np[turnRef.current].forecast = Math.max(0, np[turnRef.current].forecast - 1);
+      return np;
+    });
+    setArmedPowerup(null);
+    if (!tile) { setForecast({ keys: [key(q, r)], until: Date.now() + FORECAST_MS }); return; }
+    const { group, blocked } = computeSweep(b, R, q, r, tile.dir);
+    if (blocked || group.length === 0) {
+      setForecast({ keys: [key(q, r)], until: Date.now() + FORECAST_MS });
+      blip.errSoft();
+      return;
+    }
+    setForecast({ keys: group.map((g) => key(g.q, g.r)), until: Date.now() + FORECAST_MS });
   };
 
   const flyDone = (id) => setFlying((f) => f.filter((x) => x.id !== id));
@@ -583,9 +878,44 @@ export default function HexBlast() {
                   <div style={{ ...styles.playerScore, color: active ? "#fff" : "#cdc7da" }}>
                     {pScores[i].toLocaleString()}
                   </div>
+                  <div style={styles.powerupRow}>
+                    {POWERUPS.map((pu) => {
+                      const count = pPowerups[i][pu.type];
+                      const canTap = active && count > 0 && !animLockRef.current;
+                      const armed = active && armedPowerup === pu.type;
+                      const Icon = POWERUP_ICON[pu.type];
+                      return (
+                        <button key={pu.type}
+                          disabled={!canTap}
+                          onClick={() => armPowerup(pu.type)}
+                          title={`${pu.name} — ${pu.blurb}`}
+                          style={{
+                            ...styles.puBtn,
+                            opacity: count === 0 ? 0.32 : active ? 1 : 0.55,
+                            borderColor: armed ? pu.tint : "rgba(255,255,255,.1)",
+                            background: armed ? `${pu.tint}28` : "rgba(255,255,255,.04)",
+                            boxShadow: armed ? `0 0 0 1px ${pu.tint}, 0 0 14px ${pu.tint}66` : "none",
+                            color: armed ? pu.tint : "#cdc7da",
+                            cursor: canTap ? "pointer" : "default",
+                          }}>
+                          <Icon size={15} strokeWidth={2.2} />
+                          <span style={styles.puCount}>{count}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               );
             })}
+          </div>
+        )}
+        {/* armed-powerup hint */}
+        {mode === "2p" && armedPowerup && (
+          <div style={styles.hint}>
+            {armedPowerup === "bomb" && "Tap any tile to bomb it + its 6 neighbors."}
+            {armedPowerup === "forecast" && "Tap a tile to preview its sweep."}
+            {armedPowerup === "wildTap" && "Tap a tile, then pick a direction."}
+            {armedPowerup === "freeTurn" && "Your next successful move won't pass the turn."}
           </div>
         )}
 
@@ -669,6 +999,22 @@ export default function HexBlast() {
                 </g>
               );
             })}
+            {/* forecast preview glow */}
+            {forecast && forecast.keys.map((fk) => {
+              const [q, r] = fk.split(",").map(Number);
+              const p = px(q, r);
+              return (
+                <g key={"fc" + fk} transform={`translate(${p.x},${p.y})`} className="forecastGlow" style={{ pointerEvents: "none" }}>
+                  <polygon
+                    points={Array.from({ length: 6 }, (_, i) => {
+                      const a = (Math.PI / 180) * 60 * i;
+                      return `${(SIZE * 1.05 * Math.cos(a)).toFixed(2)},${(SIZE * 1.05 * Math.sin(a)).toFixed(2)}`;
+                    }).join(" ")}
+                    fill="none" stroke="#3fd1ff" strokeWidth={2.2} opacity={0.9}
+                  />
+                </g>
+              );
+            })}
             {/* live tiles */}
             {[...board.entries()].map(([k, t]: any) => {
               const [q, r] = k.split(",").map(Number);
@@ -681,7 +1027,7 @@ export default function HexBlast() {
                   className="tile"
                   onClick={() => launch(q, r)}
                 >
-                  <HexShape color={t.color} dir={t.dir} />
+                  <HexShape color={t.color} dir={t.dir} modifier={t.modifier} />
                 </g>
               );
             })}
@@ -710,11 +1056,41 @@ export default function HexBlast() {
                       anim.onfinish = () => flyDone(f.id);
                     }}
                   >
-                    <HexShape color={f.color} dir={f.dir} />
+                    <HexShape color={f.color} dir={f.dir} modifier={f.modifier} />
                   </g>
                 </g>
               );
             })}
+            {/* wildTap direction picker */}
+            {wildPick && (() => {
+              const wp = wildPick;
+              const p = px(wp.q, wp.r);
+              const A = SIZE * 0.42, hw = SIZE * 0.3, hy = 0, sw = SIZE * 0.12, sb = SIZE * 0.42;
+              const arrow = `M0,${-A} L${hw},${hy} L${sw},${hy} L${sw},${sb} L${-sw},${sb} L${-sw},${hy} L${-hw},${hy} Z`;
+              return (
+                <g transform={`translate(${p.x},${p.y})`}>
+                  <circle r={SIZE * 2.2} fill="rgba(8,6,14,.55)" onClick={() => setWildPick(null)} style={{ cursor: "pointer" }} />
+                  <g onClick={() => setWildPick(null)} style={{ cursor: "pointer" }}>
+                    <circle r={SIZE * 0.38} fill="rgba(20,16,32,.92)" stroke="#cdc7da" strokeWidth={1.4} />
+                    <text textAnchor="middle" y={SIZE * 0.18} style={{ font: `700 ${(SIZE * 0.5).toFixed(1)}px 'Space Mono', monospace`, fill: "#cdc7da", pointerEvents: "none" }}>×</text>
+                  </g>
+                  {DIR_KEYS.map((dn) => {
+                    const dd = DIRS[dn];
+                    const u = dirUnitPx(dd);
+                    const off = STEP_PX * 1.05;
+                    const cc = COLORS[DIR_COLOR[dn]];
+                    return (
+                      <g key={dn} transform={`translate(${u.x * off},${u.y * off})`} onClick={() => launchWildTap(dn)} style={{ cursor: "pointer" }} className="dirPick">
+                        <circle r={SIZE * 0.42} fill={cc.base} stroke="#fff" strokeWidth={1.6} />
+                        <g transform={`rotate(${dd.angle})`}>
+                          <path d={arrow} fill={cc.arrow} stroke="rgba(0,0,0,.18)" strokeWidth={0.6} />
+                        </g>
+                      </g>
+                    );
+                  })}
+                </g>
+              );
+            })()}
             {/* score popups */}
             {pops.map((p) => {
               const line2 = [...p.tags, p.mult > 1 ? `CHAIN ×${p.mult}` : null].filter(Boolean).join("  ·  ");
@@ -794,6 +1170,12 @@ export default function HexBlast() {
               <li><b>◆ Diagonal bonus:</b> sweep along a <i>diagonal</i> (orange, yellow, blue, violet) for an extra payout.</li>
               <li><b>Chains (solo only):</b> fire again before the chain meter empties to stack ×2, ×3… on every point you earn.</li>
               <li><b>2 Player:</b> players alternate turns — even on a blocked tap, your turn ends. No chain multiplier. Highest score when the grid clears wins.</li>
+              <li><b>2P modifier cells:</b> some tiles wear a badge. Trigger by sweeping the tile or any of its 6 neighbors.
+                <span style={{ display: "block", marginTop: 6, color: "#a59fb6", fontSize: 13 }}>
+                  <b style={{ color: "#ffd23f" }}>★ Star</b> ×2 score · <b style={{ color: "#3fd1ff" }}>◆ Crystal</b> ×3 score · <b>◎ Wildcard</b> counts as any color · <b style={{ color: "#ff9d2e" }}>⊕ Chain</b> extra turn · <b style={{ color: "#a45cff" }}>↠ Sling</b> sweep past one blocker
+                </span>
+              </li>
+              <li><b>2P powerups:</b> each player gets a starting hand of 4 one-shots — <b>Bomb</b> clears a tile + 6 neighbors · <b>Forecast</b> previews a sweep for free · <b>Wild Tap</b> launches in any direction you pick · <b>Free Turn</b> keeps the turn after your next move.</li>
               <li><b>Goal:</b> clear every tile. Each board is always solvable.</li>
             </ul>
             <button style={styles.cta} onClick={() => setHelp(false)}>Got it</button>
@@ -827,6 +1209,12 @@ const css = `
 }
 .pop text{transform:translateY(0);animation:popRise .95s ease-out forwards;}
 @keyframes popRise{from{transform:translateY(6px);}to{transform:translateY(-26px);}}
+.forecastGlow polygon{animation:fcPulse 1.6s ease-out forwards;transform-origin:center;transform-box:fill-box;}
+@keyframes fcPulse{0%{opacity:0;transform:scale(.85);}18%{opacity:1;transform:scale(1.05);}80%{opacity:.95;transform:scale(1);}100%{opacity:0;transform:scale(1.1);}}
+.dirPick{animation:dirPop .18s ease-out backwards;transform-origin:center;transform-box:fill-box;}
+@keyframes dirPop{from{opacity:0;transform:scale(.6);}to{opacity:1;transform:scale(1);}}
+.dirPick:hover{filter:brightness(1.15) drop-shadow(0 0 6px rgba(255,255,255,.4));}
+.dirPick:active{filter:brightness(.92);}
 `;
 
 const styles: Record<string, React.CSSProperties> = {
@@ -877,6 +1265,23 @@ const styles: Record<string, React.CSSProperties> = {
   playerScore: {
     fontFamily: "'Space Mono', monospace", fontWeight: 700, fontSize: 26, marginTop: 4,
     transition: "color .25s",
+  },
+  powerupRow: {
+    display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 5, marginTop: 10,
+  },
+  puBtn: {
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
+    padding: "6px 0", borderRadius: 9, border: "1px solid rgba(255,255,255,.1)",
+    background: "rgba(255,255,255,.04)", color: "#cdc7da",
+    fontFamily: "'Space Mono', monospace", fontWeight: 700, fontSize: 12,
+    transition: "background .15s, border-color .15s, box-shadow .15s, color .15s",
+  },
+  puCount: { fontSize: 11, opacity: 0.85 },
+  hint: {
+    textAlign: "center", fontFamily: "'Space Mono', monospace", fontSize: 12,
+    color: "#ffd23f", padding: "8px 10px", borderRadius: 10,
+    background: "rgba(255,210,63,.08)", border: "1px solid rgba(255,210,63,.25)",
+    marginTop: -4,
   },
   chainWrap: { display: "flex", alignItems: "center", gap: 12 },
   chainLabel: { fontSize: 13, fontWeight: 700, letterSpacing: 1, minWidth: 78, transition: "opacity .2s,color .2s" },
