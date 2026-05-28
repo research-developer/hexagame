@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { RotateCcw, Undo2, Volume2, VolumeX, HelpCircle, Zap, ChevronRight, X, User, Users, Bomb, Eye, Sparkles, Repeat } from "lucide-react";
+import { RotateCcw, Undo2, Volume2, VolumeX, HelpCircle, Zap, ChevronRight, X, User, Users, Bomb, Eye, Sparkles, Repeat, Hand, Compass, Wind, Ban, Target, Trophy, Diamond, Link2, Star, Wand2 } from "lucide-react";
 
 /*  HEX BLAST  — an original sweep-combo hex puzzle.
     Tap a tile: it folds cell-by-cell off the board in its arrow direction,
@@ -98,6 +98,60 @@ function sprinkleModifiers(board: Map<string, any>, R: number) {
     board.set(k, { ...t, modifier: mod });
   }
 }
+
+// ---------- help content (split into Basics / Scoring / 2-Player) ----------
+const HELP_PAGES = [
+  {
+    label: "Basics",
+    icon: Compass,
+    rules: [
+      { icon: Hand, title: "Tap a tile", body: "it folds cell-by-cell off the board in the direction its arrow points." },
+      { icon: Compass, title: "Color = direction", body: "red ↑, orange ↗, yellow ↘, green ↓, blue ↙, violet ↖. Same color in a row makes a sweepable lane." },
+      { icon: Wind, title: "Sweep combo", body: "any same-color tile in the path tumbles off with the shot. Empty gaps pass freely." },
+      { icon: Ban, title: "Blocked", body: "a different-color tile stops the shot. The tapped tile leans forward and reflects back." },
+      { icon: Target, title: "Goal", body: "clear every tile. Each board is always solvable." },
+    ] as any,
+  },
+  {
+    label: "Scoring",
+    icon: Trophy,
+    rules: [
+      { icon: Trophy, title: "Big sweeps win", body: "scoring is quadratic — a 5-tile sweep is worth far more than five singles." },
+      { icon: Diamond, title: "Diagonal bonus", body: "sweep along a diagonal (orange, yellow, blue, violet) for an extra payout." },
+      { icon: Link2, title: "Chains (solo only)", body: "fire again before the chain meter empties to stack ×2, ×3… on every point you earn. Disabled in 2-player." },
+    ] as any,
+  },
+  {
+    label: "2-Player",
+    icon: Users,
+    rules: [
+      { icon: Users, title: "Alternate turns", body: "even a blocked tap ends your turn. Highest score when the grid clears wins." },
+      {
+        icon: Star,
+        title: "Modifier cells",
+        body: "some tiles wear a badge. Triggered by sweeping the tile OR any of its 6 neighbors.",
+        chips: [
+          { glyph: "★", label: "Star",    tint: "#ffd23f", desc: "sweep scores ×2" },
+          { glyph: "◆", label: "Crystal", tint: "#3fd1ff", desc: "sweep scores ×3" },
+          { glyph: "◎", label: "Wildcard",tint: "#f4f1fa", desc: "counts as any color (stays on board)" },
+          { glyph: "⊕", label: "Chain",   tint: "#ff9d2e", desc: "extra turn after this move" },
+          { glyph: "↠", label: "Sling",   tint: "#a45cff", desc: "sweep past one blocker" },
+        ],
+      },
+      {
+        icon: Wand2,
+        title: "Powerups",
+        body: "each player starts with 1 of each. Tap to arm, tap again to cancel.",
+        icons: [
+          { icon: Bomb,     label: "Bomb",      tint: "#ff4d4d", desc: "clears a tile + its 6 neighbors" },
+          { icon: Eye,      label: "Forecast",  tint: "#3fd1ff", desc: "previews a sweep, no turn cost" },
+          { icon: Sparkles, label: "Wild Tap",  tint: "#ffd23f", desc: "launch in any direction you pick" },
+          { icon: Repeat,   label: "Free Turn", tint: "#34d36b", desc: "keep the turn after your next move" },
+        ],
+      },
+    ] as any,
+  },
+];
 
 // ---------- hex geometry ----------
 const px = (q, r) => ({ x: SIZE * 1.5 * q, y: SIZE * Math.sqrt(3) * (r + q / 2) });
@@ -421,6 +475,7 @@ export default function HexBlast() {
   const [chain, setChain] = useState({ mult: 1, expire: 0, barKey: 0 });
   const [won, setWon] = useState(false);
   const [help, setHelp] = useState(false);
+  const [helpPage, setHelpPage] = useState(0);
   const [sound, setSound] = useState(true);
 
   // 2P powerups: per-player inventory; one powerup armed at a time (active player)
@@ -825,7 +880,7 @@ export default function HexBlast() {
             <button style={styles.iconBtn} onClick={() => setSound((s) => !s)} title="sound">
               {sound ? <Volume2 size={18} /> : <VolumeX size={18} />}
             </button>
-            <button style={styles.iconBtn} onClick={() => setHelp(true)} title="how to play">
+            <button style={styles.iconBtn} onClick={() => { setHelpPage(0); setHelp(true); }} title="how to play">
               <HelpCircle size={18} />
             </button>
           </div>
@@ -1161,24 +1216,77 @@ export default function HexBlast() {
           <div style={styles.card} onClick={(e) => e.stopPropagation()}>
             <button style={styles.close} onClick={() => setHelp(false)}><X size={18} /></button>
             <h2 style={styles.cardTitle}>HOW TO PLAY</h2>
+            <div style={styles.helpTabs}>
+              {HELP_PAGES.map((pg, i) => {
+                const TIcon = pg.icon;
+                const on = helpPage === i;
+                return (
+                  <button key={pg.label} onClick={() => setHelpPage(i)}
+                    style={{ ...styles.helpTab, ...(on ? styles.helpTabOn : {}) }}>
+                    <TIcon size={14} strokeWidth={2.4} /> {pg.label}
+                  </button>
+                );
+              })}
+            </div>
             <ul style={styles.rules}>
-              <li><b>Tap a tile</b> — it folds cell-by-cell off the board in the direction its arrow points.</li>
-              <li><b>Color = direction:</b> each rainbow color points its own way — red ↑, orange ↗, yellow ↘, green ↓, blue ↙, violet ↖. Same color in a row = sweepable lane.</li>
-              <li><b>Sweep combo:</b> any tile in its path pointing the <i>same</i> direction (same color) tumbles off <i>with</i> it. Empty gaps are passed over freely.</li>
-              <li><b>Blocked:</b> a tile of a <i>different</i> color stops the shot. The tapped tile leans forward, plays a soft error tone, and reflects back to its origin.</li>
-              <li><b>Score:</b> big sweeps pay off fast — a 5-tile sweep is worth far more than five singles.</li>
-              <li><b>◆ Diagonal bonus:</b> sweep along a <i>diagonal</i> (orange, yellow, blue, violet) for an extra payout.</li>
-              <li><b>Chains (solo only):</b> fire again before the chain meter empties to stack ×2, ×3… on every point you earn.</li>
-              <li><b>2 Player:</b> players alternate turns — even on a blocked tap, your turn ends. No chain multiplier. Highest score when the grid clears wins.</li>
-              <li><b>2P modifier cells:</b> some tiles wear a badge. Trigger by sweeping the tile or any of its 6 neighbors.
-                <span style={{ display: "block", marginTop: 6, color: "#a59fb6", fontSize: 13 }}>
-                  <b style={{ color: "#ffd23f" }}>★ Star</b> ×2 score · <b style={{ color: "#3fd1ff" }}>◆ Crystal</b> ×3 score · <b>◎ Wildcard</b> counts as any color · <b style={{ color: "#ff9d2e" }}>⊕ Chain</b> extra turn · <b style={{ color: "#a45cff" }}>↠ Sling</b> sweep past one blocker
-                </span>
-              </li>
-              <li><b>2P powerups:</b> each player gets a starting hand of 4 one-shots — <b>Bomb</b> clears a tile + 6 neighbors · <b>Forecast</b> previews a sweep for free · <b>Wild Tap</b> launches in any direction you pick · <b>Free Turn</b> keeps the turn after your next move.</li>
-              <li><b>Goal:</b> clear every tile. Each board is always solvable.</li>
+              {HELP_PAGES[helpPage].rules.map((r, i) => {
+                const RIcon = r.icon;
+                return (
+                  <li key={i} style={styles.rule}>
+                    <span style={styles.ruleIcon}><RIcon size={18} strokeWidth={2.2} /></span>
+                    <div style={styles.ruleBody}>
+                      <div><b>{r.title}</b> — {r.body}</div>
+                      {r.chips && (
+                        <div style={styles.chipGrid}>
+                          {r.chips.map((c) => (
+                            <div key={c.label} style={styles.chip}>
+                              <span style={{ ...styles.chipGlyph, color: c.tint }}>{c.glyph}</span>
+                              <div style={styles.chipText}>
+                                <div style={{ color: c.tint, fontWeight: 700, fontSize: 12 }}>{c.label}</div>
+                                <div style={styles.chipDesc}>{c.desc}</div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {r.icons && (
+                        <div style={styles.chipGrid}>
+                          {r.icons.map((c) => {
+                            const CIcon = c.icon;
+                            return (
+                              <div key={c.label} style={styles.chip}>
+                                <span style={{ ...styles.chipGlyph, color: c.tint, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                  <CIcon size={18} strokeWidth={2.2} color={c.tint} />
+                                </span>
+                                <div style={styles.chipText}>
+                                  <div style={{ color: c.tint, fontWeight: 700, fontSize: 12 }}>{c.label}</div>
+                                  <div style={styles.chipDesc}>{c.desc}</div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
-            <button style={styles.cta} onClick={() => setHelp(false)}>Got it</button>
+            <div style={styles.helpNav}>
+              <button
+                style={{ ...styles.ghost, opacity: helpPage === 0 ? 0.4 : 1, width: 110, marginTop: 0, cursor: helpPage === 0 ? "default" : "pointer" }}
+                disabled={helpPage === 0}
+                onClick={() => setHelpPage((p) => Math.max(0, p - 1))}>
+                ← Back
+              </button>
+              {helpPage < HELP_PAGES.length - 1 ? (
+                <button style={{ ...styles.cta, flex: 1 }} onClick={() => setHelpPage((p) => p + 1)}>
+                  Next <ChevronRight size={18} />
+                </button>
+              ) : (
+                <button style={{ ...styles.cta, flex: 1 }} onClick={() => setHelp(false)}>Got it</button>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -1317,9 +1425,10 @@ const styles: Record<string, React.CSSProperties> = {
     display: "grid", placeItems: "center", padding: 20, zIndex: 50, animation: "fade .25s ease",
   },
   card: {
-    position: "relative", width: "100%", maxWidth: 360, textAlign: "center",
+    position: "relative", width: "100%", maxWidth: 360, maxHeight: "92vh", textAlign: "center",
     background: "linear-gradient(160deg,#221d33,#161221)", border: "1px solid rgba(255,255,255,.1)",
     borderRadius: 24, padding: "30px 26px", boxShadow: "0 30px 80px rgba(0,0,0,.6)",
+    overflowY: "auto",
   },
   cardBadge: {
     width: 56, height: 56, margin: "0 auto 14px", borderRadius: 16, display: "grid", placeItems: "center",
@@ -1348,7 +1457,41 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid rgba(255,255,255,.12)", background: "rgba(255,255,255,.05)",
     color: "#cfc9dd", display: "grid", placeItems: "center", cursor: "pointer",
   },
-  rules: { textAlign: "left", margin: "8px 0 20px", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 11, fontSize: 14, color: "#cdc7da", lineHeight: 1.45 } as React.CSSProperties,
+  rules: { textAlign: "left", margin: "10px 0 18px", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 13, fontSize: 14, color: "#cdc7da", lineHeight: 1.45 } as React.CSSProperties,
+  rule: { display: "flex", gap: 11, alignItems: "flex-start" },
+  ruleIcon: {
+    flex: "0 0 28px", height: 28, borderRadius: 9, display: "grid", placeItems: "center",
+    background: "rgba(255,255,255,.06)", border: "1px solid rgba(255,255,255,.1)",
+    color: "#ffd23f", marginTop: 1,
+  },
+  ruleBody: { flex: 1, minWidth: 0 },
+  chipGrid: { display: "flex", flexDirection: "column", gap: 6, marginTop: 8 },
+  chip: {
+    display: "flex", alignItems: "center", gap: 9, padding: "6px 9px",
+    borderRadius: 9, background: "rgba(255,255,255,.04)", border: "1px solid rgba(255,255,255,.08)",
+  },
+  chipGlyph: {
+    flex: "0 0 22px", height: 22, textAlign: "center" as const,
+    font: "700 17px 'Space Mono', monospace", lineHeight: "22px",
+  },
+  chipText: { flex: 1, minWidth: 0 },
+  chipDesc: { fontSize: 12, color: "#a59fb6", marginTop: 1 },
+  helpTabs: {
+    display: "flex", gap: 6, background: "rgba(255,255,255,.05)",
+    padding: 4, borderRadius: 12, border: "1px solid rgba(255,255,255,.07)",
+    marginTop: 14,
+  },
+  helpTab: {
+    flex: 1, padding: "8px 0", borderRadius: 9, border: "none", cursor: "pointer",
+    background: "transparent", color: "#9b95ad",
+    fontFamily: "'Fredoka',sans-serif", fontWeight: 700, fontSize: 13,
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
+  },
+  helpTabOn: {
+    background: "linear-gradient(135deg,#ffd23f,#ff9d2e)", color: "#3a2300",
+    boxShadow: "0 4px 12px rgba(255,157,46,.3)",
+  },
+  helpNav: { display: "flex", gap: 10, alignItems: "stretch" },
 };
 
 // keyframes that can't live in inline styles
